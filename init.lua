@@ -12,7 +12,7 @@ local tabRefreshIntervalSeconds = 2
 local historyRefreshIntervalSeconds = 300
 local historyLimit = 2000
 local mru = {}
-local lastActiveKey = nil
+local mruOrder = {}
 local chooser = nil
 local chooserVisible = false
 local keyDown = hs.eventtap.event.types.keyDown
@@ -33,6 +33,9 @@ local ctrlTabChordActive = false
 local ctrlTabDidCycle = false
 local knownTabKeys = {}
 local hasInitialTabCache = false
+local currentActiveTab = nil
+local currentActiveKey = nil
+local timers = {}
 
 local function trim(s)
   return (s or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -190,25 +193,73 @@ local function tabKey(tab)
   return tostring(tab.windowId) .. ":" .. tostring(tab.tabId)
 end
 
-local function rememberTab(tab)
+local function removeMruKey(key)
+  for i = #mruOrder, 1, -1 do
+    if mruOrder[i] == key then
+      table.remove(mruOrder, i)
+    end
+  end
+end
+
+local function pruneMruOrder(validKeys)
+  for i = #mruOrder, 1, -1 do
+    local key = mruOrder[i]
+    if not validKeys[key] then
+      table.remove(mruOrder, i)
+      mru[key] = nil
+    end
+  end
+end
+
+local function rememberTab(tab, promote)
   local key = tabKey(tab)
   if not key then
     return
   end
 
-  local changed = key ~= lastActiveKey
-  lastActiveKey = key
   local existing = mru[key] or {}
   existing.windowId = tab.windowId
   existing.tabId = tab.tabId
   existing.title = tab.title
   existing.url = tab.url
-  if changed or not existing.rank then
+  if promote or not existing.rank then
     visitSeq = visitSeq + 1
     existing.rank = visitSeq
     existing.seenAt = hs.timer.secondsSinceEpoch()
   end
   mru[key] = existing
+
+  if promote then
+    removeMruKey(key)
+    table.insert(mruOrder, 1, key)
+  end
+end
+
+local function observeActiveTab(active)
+  local key = tabKey(active)
+  if not key then
+    return
+  end
+
+  if currentActiveKey == nil then
+    currentActiveKey = key
+    currentActiveTab = active
+    cachedActiveKey = key
+    rememberTab(active, false)
+    return
+  end
+
+  if key ~= currentActiveKey then
+    if currentActiveTab then
+      rememberTab(currentActiveTab, true)
+    end
+    currentActiveKey = key
+  end
+
+  currentActiveTab = active
+  cachedActiveKey = key
+  rememberTab(active, false)
+  removeMruKey(key)
 end
 
 local function getActiveTab()
@@ -252,7 +303,7 @@ local function recordActiveChromeTab()
 
   local active = getActiveTab()
   if active then
-    rememberTab(active)
+    observeActiveTab(active)
   end
 end
 
@@ -307,13 +358,16 @@ local function refreshTabCache()
     cachedActiveKey = nil
     knownTabKeys = {}
     hasInitialTabCache = false
+    currentActiveTab = nil
+    currentActiveKey = nil
+    mru = {}
+    mruOrder = {}
     return
   end
 
   local active = getActiveTab()
   if active then
-    rememberTab(active)
-    cachedActiveKey = tabKey(active)
+    observeActiveTab(active)
   end
   local tabs = getAllTabs()
   local currentKeys = {}
@@ -322,19 +376,12 @@ local function refreshTabCache()
     if key then
       currentKeys[key] = true
       if hasInitialTabCache and not knownTabKeys[key] and key ~= cachedActiveKey then
-        visitSeq = visitSeq + 1
-        mru[key] = {
-          windowId = tab.windowId,
-          tabId = tab.tabId,
-          title = tab.title,
-          url = tab.url,
-          rank = visitSeq,
-          seenAt = hs.timer.secondsSinceEpoch(),
-          discovered = true,
-        }
+        rememberTab(tab, true)
+        mru[key].discovered = true
       end
     end
   end
+  pruneMruOrder(currentKeys)
   knownTabKeys = currentKeys
   hasInitialTabCache = true
   cachedTabs = tabs
@@ -411,9 +458,9 @@ LIMIT %d;
 end
 
 local function switchToTab(choice)
-  local previous = getActiveTab()
+  local previous = getActiveTab() or currentActiveTab
   if previous then
-    rememberTab(previous)
+    rememberTab(previous, true)
   end
 
   local script = string.format([[
@@ -441,7 +488,14 @@ return false
   end
 
   cachedActiveKey = choiceKey(choice)
-  lastActiveKey = cachedActiveKey or lastActiveKey
+  currentActiveKey = cachedActiveKey
+  currentActiveTab = {
+    windowId = choice.windowId,
+    tabId = choice.tabId,
+    title = choice.text,
+    url = choice.url,
+  }
+  removeMruKey(cachedActiveKey)
   hs.timer.doAfter(0.2, refreshTabCache)
 end
 
@@ -502,15 +556,27 @@ local function mruRank(tab, activeKey)
   if key == activeKey then
     return -math.huge
   end
+  for i, mruKey in ipairs(mruOrder) do
+    if mruKey == key then
+      return 1000000000000000000 - i
+    end
+  end
   if mru[key] and mru[key].rank then
-    return 1000000000000000000 + mru[key].rank
+    return 500000000000000000 + mru[key].rank
   end
   return historyByUrl[tab.url or ""] or 0
 end
 
-local function tabChoices(query)
+local function tabChoices(query, includeImages)
+  if includeImages == nil then
+    includeImages = true
+  end
   local q = trim(query or "")
-  local activeKey = cachedActiveKey or lastActiveKey
+  local active = getActiveTab()
+  if active then
+    observeActiveTab(active)
+  end
+  local activeKey = cachedActiveKey or currentActiveKey
   local tabs = cachedTabs
 
   table.sort(tabs, function(a, b)
@@ -539,7 +605,7 @@ local function tabChoices(query)
       table.insert(choices, {
         text = title,
         subText = displaySource(prefix, url),
-        image = faviconForUrl(url),
+        image = includeImages and faviconForUrl(url) or nil,
         windowId = tab.windowId,
         tabId = tab.tabId,
         url = url,
@@ -582,7 +648,7 @@ local function tabChoices(query)
         table.insert(choices, {
           text = title,
           subText = displaySource("Recent", url),
-          image = faviconForUrl(url),
+          image = includeImages and faviconForUrl(url) or nil,
           url = url,
           kind = "history",
         })
@@ -599,7 +665,7 @@ local function tabChoices(query)
     table.insert(choices, {
       text = 'Search "' .. q .. '"',
       subText = "Google",
-      image = googleIcon(),
+      image = includeImages and googleIcon() or nil,
       query = q,
       kind = "search",
     })
@@ -609,7 +675,7 @@ local function tabChoices(query)
     table.insert(choices, {
       text = "No Chrome tabs",
       subText = "Type to search",
-      image = hs.image.imageFromAppBundle(chromeBundleID),
+      image = includeImages and hs.image.imageFromAppBundle(chromeBundleID) or nil,
       kind = "noop",
     })
   end
@@ -694,9 +760,9 @@ end
 
 refreshTabCache()
 refreshHistoryCache()
-hs.timer.doEvery(recordIntervalSeconds, recordActiveChromeTab)
-hs.timer.doEvery(tabRefreshIntervalSeconds, refreshTabCache)
-hs.timer.doEvery(historyRefreshIntervalSeconds, refreshHistoryCache)
+timers.recordActiveChromeTab = hs.timer.doEvery(recordIntervalSeconds, recordActiveChromeTab)
+timers.refreshTabCache = hs.timer.doEvery(tabRefreshIntervalSeconds, refreshTabCache)
+timers.refreshHistoryCache = hs.timer.doEvery(historyRefreshIntervalSeconds, refreshHistoryCache)
 
 local function isCtrlTabCombo(flags)
   return flags.ctrl and not flags.cmd and not flags.alt and not flags.fn
@@ -766,7 +832,7 @@ ChromeSwitcher = {
   show = showChromeSwitcher,
   defaultChoices = function()
     local out = {}
-    for i, choice in ipairs(tabChoices("")) do
+    for i, choice in ipairs(tabChoices("", false)) do
       if i > 10 then
         break
       end
@@ -781,7 +847,7 @@ ChromeSwitcher = {
   end,
   queryChoices = function(query)
     local out = {}
-    for i, choice in ipairs(tabChoices(query or "")) do
+    for i, choice in ipairs(tabChoices(query or "", false)) do
       if i > 12 then
         break
       end
@@ -794,6 +860,22 @@ ChromeSwitcher = {
     end
     return out
   end,
+  mru = function()
+    local out = {}
+    for i, key in ipairs(mruOrder) do
+      if i > 10 then
+        break
+      end
+      local item = mru[key]
+      table.insert(out, {
+        key = key,
+        title = item and item.title or "",
+        url = item and item.url or "",
+        rank = item and item.rank or 0,
+      })
+    end
+    return out
+  end,
   status = function()
     local selectedRow = nil
     if chooser then
@@ -801,14 +883,25 @@ ChromeSwitcher = {
         selectedRow = chooser:selectedRow()
       end)
     end
+    local active = getActiveTab()
+    if active then
+      observeActiveTab(active)
+    end
     return {
       chooserVisible = chooserVisible,
       chromeRunning = chromeIsRunning(),
       secureInput = hs.eventtap.isSecureInputEnabled(),
       keyWatcherEnabled = keyWatcher and keyWatcher:isEnabled(),
       selectedRow = selectedRow,
-      activeTab = getActiveTab(),
+      activeTab = active,
       tabCount = #cachedTabs,
+      mruCount = #mruOrder,
+      currentActiveKey = currentActiveKey,
+      timers = {
+        recordActiveChromeTab = timers.recordActiveChromeTab and timers.recordActiveChromeTab:running(),
+        refreshTabCache = timers.refreshTabCache and timers.refreshTabCache:running(),
+        refreshHistoryCache = timers.refreshHistoryCache and timers.refreshHistoryCache:running(),
+      },
       historyCount = #cachedHistory,
       historyUrlCount = tableKeyCount(historyByUrl),
       historyRefreshing = historyRefreshing,
