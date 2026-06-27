@@ -31,6 +31,8 @@ local visitSeq = 0
 local iconCache = {}
 local ctrlTabChordActive = false
 local ctrlTabDidCycle = false
+local knownTabKeys = {}
+local hasInitialTabCache = false
 
 local function trim(s)
   return (s or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -303,6 +305,8 @@ local function refreshTabCache()
   if not chromeIsRunning() then
     cachedTabs = {}
     cachedActiveKey = nil
+    knownTabKeys = {}
+    hasInitialTabCache = false
     return
   end
 
@@ -311,7 +315,29 @@ local function refreshTabCache()
     rememberTab(active)
     cachedActiveKey = tabKey(active)
   end
-  cachedTabs = getAllTabs()
+  local tabs = getAllTabs()
+  local currentKeys = {}
+  for _, tab in ipairs(tabs) do
+    local key = tabKey(tab)
+    if key then
+      currentKeys[key] = true
+      if hasInitialTabCache and not knownTabKeys[key] and key ~= cachedActiveKey then
+        visitSeq = visitSeq + 1
+        mru[key] = {
+          windowId = tab.windowId,
+          tabId = tab.tabId,
+          title = tab.title,
+          url = tab.url,
+          rank = visitSeq,
+          seenAt = hs.timer.secondsSinceEpoch(),
+          discovered = true,
+        }
+      end
+    end
+  end
+  knownTabKeys = currentKeys
+  hasInitialTabCache = true
+  cachedTabs = tabs
 end
 
 local function parseHistoryRows(raw)
