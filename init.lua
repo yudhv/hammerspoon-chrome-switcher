@@ -7,8 +7,8 @@ end)
 
 local chromeBundleID = "com.google.Chrome"
 local userAgent = "Arc-style Chrome switcher"
-local recordIntervalSeconds = 0.6
 local tabRefreshIntervalSeconds = 2
+local tabRefreshTimeoutSeconds = 1.5
 local historyRefreshIntervalSeconds = 300
 local historyLimit = 2000
 local mru = {}
@@ -27,8 +27,12 @@ local cachedActiveKey = nil
 local cachedHistory = {}
 local historyByUrl = {}
 local historyRefreshing = false
+local tabRefreshing = false
+local tabRefreshTask = nil
 local visitSeq = 0
 local iconCache = {}
+local pendingIcons = {}
+local chromeIcon = nil
 local ctrlTabChordActive = false
 local ctrlTabDidCycle = false
 local knownTabKeys = {}
@@ -113,19 +117,35 @@ end
 local function faviconForUrl(url)
   local host = urlHost(url)
   if host == "" then
-    return hs.image.imageFromAppBundle(chromeBundleID)
+    if not chromeIcon then
+      chromeIcon = hs.image.imageFromAppBundle(chromeBundleID)
+      if chromeIcon then
+        chromeIcon:setSize({ w = 18, h = 18 })
+      end
+    end
+    return chromeIcon
   end
   if iconCache[host] then
     return iconCache[host]
   end
 
   local faviconUrl = "https://www.google.com/s2/favicons?sz=64&domain_url=" .. hs.http.encodeForQuery("https://" .. host)
-  local image = hs.image.imageFromURL(faviconUrl)
-  if image then
-    image:setSize({ w = 18, h = 18 })
-    iconCache[host] = image
+  if not pendingIcons[host] then
+    pendingIcons[host] = true
+    local safeHost = host:gsub("[^%w._-]", "_")
+    local iconPath = "/tmp/hammerspoon_chrome_switcher_icon_" .. safeHost .. ".png"
+    hs.task.new("/usr/bin/curl", function(exitCode)
+      pendingIcons[host] = nil
+      if exitCode == 0 then
+        local image = hs.image.imageFromPath(iconPath)
+        if image then
+          image:setSize({ w = 18, h = 18 })
+          iconCache[host] = image
+        end
+      end
+    end, { "-L", "--max-time", "1.5", "-sS", "-o", iconPath, faviconUrl }):start()
   end
-  return image
+  return faviconForUrl("")
 end
 
 local function googleIcon()
@@ -365,26 +385,101 @@ local function refreshTabCache()
     return
   end
 
-  local active = getActiveTab()
-  if active then
-    observeActiveTab(active)
+  if tabRefreshing then
+    return
   end
-  local tabs = getAllTabs()
-  local currentKeys = {}
-  for _, tab in ipairs(tabs) do
-    local key = tabKey(tab)
-    if key then
-      currentKeys[key] = true
-      if hasInitialTabCache and not knownTabKeys[key] and key ~= cachedActiveKey then
-        rememberTab(tab, true)
-        mru[key].discovered = true
+  tabRefreshing = true
+
+  local script = [[
+set us to ASCII character 31
+set rs to ASCII character 30
+set rows to {}
+tell application "Google Chrome"
+  if (count of windows) = 0 then return ""
+  set frontWid to id of front window
+  repeat with wi from 1 to count of windows
+    set w to window wi
+    set wid to id of w
+    set activeIndex to active tab index of w
+    repeat with ti from 1 to count of tabs of w
+      set t to tab ti of w
+      set isActive to "0"
+      if wid is frontWid and ti is activeIndex then set isActive to "1"
+      set end of rows to (wid as text) & us & (wi as text) & us & (ti as text) & us & ((id of t) as text) & us & (title of t) & us & (URL of t) & us & isActive
+    end repeat
+  end repeat
+end tell
+set AppleScript's text item delimiters to rs
+return rows as text
+]]
+  local command = "/usr/bin/osascript <<'APPLESCRIPT'\n" .. script .. "\nAPPLESCRIPT"
+
+  local task
+  task = hs.task.new("/bin/zsh", function(exitCode, stdout, stderr)
+    if tabRefreshTask == task then
+      tabRefreshTask = nil
+      tabRefreshing = false
+    end
+
+    if exitCode ~= 0 then
+      hs.printf("%s tab refresh failed: %s", userAgent, tostring(stderr))
+      return
+    end
+
+    local tabs = {}
+    local active = nil
+    for _, row in ipairs(split(stdout, string.char(30))) do
+      local fields = split(row, string.char(31))
+      if #fields >= 7 then
+        local tab = {
+          windowId = fields[1],
+          windowIndex = tonumber(fields[2]),
+          tabIndex = tonumber(fields[3]),
+          tabId = fields[4],
+          title = fields[5],
+          url = fields[6],
+        }
+        table.insert(tabs, tab)
+        if fields[7] == "1" then
+          active = tab
+        end
       end
     end
-  end
-  pruneMruOrder(currentKeys)
-  knownTabKeys = currentKeys
-  hasInitialTabCache = true
-  cachedTabs = tabs
+
+    if active then
+      observeActiveTab(active)
+    end
+
+    local currentKeys = {}
+    for _, tab in ipairs(tabs) do
+      local key = tabKey(tab)
+      if key then
+        currentKeys[key] = true
+        if hasInitialTabCache and not knownTabKeys[key] and key ~= cachedActiveKey then
+          rememberTab(tab, true)
+          mru[key].discovered = true
+        end
+      end
+    end
+    pruneMruOrder(currentKeys)
+    knownTabKeys = currentKeys
+    hasInitialTabCache = true
+    cachedTabs = tabs
+  end, { "-lc", command })
+
+  tabRefreshTask = task
+  task:start()
+
+  hs.timer.doAfter(tabRefreshTimeoutSeconds, function()
+    if tabRefreshTask == task and tabRefreshing then
+      pcall(function()
+        task:terminate()
+      end)
+      tabRefreshTask = nil
+      tabRefreshing = false
+      hs.printf("%s tab refresh timed out", userAgent)
+    end
+  end)
 end
 
 local function parseHistoryRows(raw)
@@ -458,7 +553,7 @@ LIMIT %d;
 end
 
 local function switchToTab(choice)
-  local previous = getActiveTab() or currentActiveTab
+  local previous = currentActiveTab
   if previous then
     rememberTab(previous, true)
   end
@@ -467,6 +562,15 @@ local function switchToTab(choice)
 tell application "Google Chrome"
   repeat with w in windows
     if (id of w as text) is %s then
+      set targetIndex to %d
+      if targetIndex >= 1 and targetIndex <= (count of tabs of w) then
+        if (id of tab targetIndex of w as text) is %s then
+          set active tab index of w to targetIndex
+          set index of w to 1
+          activate
+          return true
+        end if
+      end if
       repeat with ti from 1 to count of tabs of w
         if (id of tab ti of w as text) is %s then
           set active tab index of w to ti
@@ -479,7 +583,7 @@ tell application "Google Chrome"
   end repeat
 end tell
 return false
-]], appleScriptString(choice.windowId), appleScriptString(choice.tabId))
+]], appleScriptString(choice.windowId), tonumber(choice.tabIndex) or 1, appleScriptString(choice.tabId), appleScriptString(choice.tabId))
 
   local result = runAppleScript(script)
   if result ~= true then
@@ -533,14 +637,15 @@ end
 
 local function activateChoice(choice)
   if type(choice) == "string" then
-    openSearch(choice)
     hideChooser()
+    openSearch(choice)
     return
   end
   if not choice then
     hideChooser()
     return
   end
+  hideChooser()
   if choice.kind == "tab" then
     switchToTab(choice)
   elseif choice.kind == "history" then
@@ -548,7 +653,6 @@ local function activateChoice(choice)
   elseif choice.kind == "search" then
     openSearch(choice.query)
   end
-  hideChooser()
 end
 
 local function mruRank(tab, activeKey)
@@ -572,10 +676,6 @@ local function tabChoices(query, includeImages)
     includeImages = true
   end
   local q = trim(query or "")
-  local active = getActiveTab()
-  if active then
-    observeActiveTab(active)
-  end
   local activeKey = cachedActiveKey or currentActiveKey
   local tabs = cachedTabs
 
@@ -607,7 +707,9 @@ local function tabChoices(query, includeImages)
         subText = displaySource(prefix, url),
         image = includeImages and faviconForUrl(url) or nil,
         windowId = tab.windowId,
+        windowIndex = tab.windowIndex,
         tabId = tab.tabId,
+        tabIndex = tab.tabIndex,
         url = url,
         kind = "tab",
       })
@@ -760,7 +862,6 @@ end
 
 refreshTabCache()
 refreshHistoryCache()
-timers.recordActiveChromeTab = hs.timer.doEvery(recordIntervalSeconds, recordActiveChromeTab)
 timers.refreshTabCache = hs.timer.doEvery(tabRefreshIntervalSeconds, refreshTabCache)
 timers.refreshHistoryCache = hs.timer.doEvery(historyRefreshIntervalSeconds, refreshHistoryCache)
 
@@ -883,25 +984,21 @@ ChromeSwitcher = {
         selectedRow = chooser:selectedRow()
       end)
     end
-    local active = getActiveTab()
-    if active then
-      observeActiveTab(active)
-    end
     return {
       chooserVisible = chooserVisible,
       chromeRunning = chromeIsRunning(),
       secureInput = hs.eventtap.isSecureInputEnabled(),
       keyWatcherEnabled = keyWatcher and keyWatcher:isEnabled(),
       selectedRow = selectedRow,
-      activeTab = active,
+      activeTab = currentActiveTab,
       tabCount = #cachedTabs,
       mruCount = #mruOrder,
       currentActiveKey = currentActiveKey,
       timers = {
-        recordActiveChromeTab = timers.recordActiveChromeTab and timers.recordActiveChromeTab:running(),
         refreshTabCache = timers.refreshTabCache and timers.refreshTabCache:running(),
         refreshHistoryCache = timers.refreshHistoryCache and timers.refreshHistoryCache:running(),
       },
+      tabRefreshing = tabRefreshing,
       historyCount = #cachedHistory,
       historyUrlCount = tableKeyCount(historyByUrl),
       historyRefreshing = historyRefreshing,
