@@ -7,6 +7,8 @@ end)
 
 local chromeBundleID = "com.google.Chrome"
 local userAgent = "Arc-style Chrome switcher"
+local activeRefreshIntervalSeconds = 0.35
+local activeRefreshTimeoutSeconds = 0.8
 local tabRefreshIntervalSeconds = 2
 local tabRefreshTimeoutSeconds = 1.5
 local historyRefreshIntervalSeconds = 300
@@ -26,6 +28,8 @@ local cachedTabs = {}
 local cachedActiveKey = nil
 local cachedHistory = {}
 local historyByUrl = {}
+local activeRefreshing = false
+local activeRefreshTask = nil
 local historyRefreshing = false
 local tabRefreshing = false
 local tabRefreshTask = nil
@@ -282,11 +286,12 @@ local function observeActiveTab(active)
   removeMruKey(key)
 end
 
-local function getActiveTab()
-  if not chromeIsRunning() then
-    return nil
+local function refreshActiveTab()
+  if not chromeIsRunning() or activeRefreshing then
+    return
   end
 
+  activeRefreshing = true
   local script = [[
 set us to ASCII character 31
 tell application "Google Chrome"
@@ -296,80 +301,50 @@ tell application "Google Chrome"
   return (id of w as text) & us & (active tab index of w as text) & us & (id of t as text) & us & (title of t) & us & (URL of t)
 end tell
 ]]
-  local result = runAppleScript(script)
-  if result == nil or result == "" then
-    return nil
-  end
+  local command = "/usr/bin/osascript <<'APPLESCRIPT'\n" .. script .. "\nAPPLESCRIPT"
 
-  local fields = split(result, string.char(31))
-  if #fields < 5 then
-    return nil
-  end
-
-  return {
-    windowId = fields[1],
-    tabIndex = tonumber(fields[2]),
-    tabId = fields[3],
-    title = fields[4],
-    url = fields[5],
-  }
-end
-
-local function recordActiveChromeTab()
-  local front = hs.application.frontmostApplication()
-  if not front or front:bundleID() ~= chromeBundleID then
-    return
-  end
-
-  local active = getActiveTab()
-  if active then
-    observeActiveTab(active)
-  end
-end
-
-local function getAllTabs()
-  if not chromeIsRunning() then
-    return {}
-  end
-
-  local script = [[
-set us to ASCII character 31
-set rs to ASCII character 30
-set rows to {}
-tell application "Google Chrome"
-  repeat with wi from 1 to count of windows
-    set w to window wi
-    set wid to id of w
-    repeat with ti from 1 to count of tabs of w
-      set t to tab ti of w
-      set end of rows to (wid as text) & us & (wi as text) & us & (ti as text) & us & ((id of t) as text) & us & (title of t) & us & (URL of t)
-    end repeat
-  end repeat
-end tell
-set AppleScript's text item delimiters to rs
-return rows as text
-]]
-  local result = runAppleScript(script)
-  local tabs = {}
-  if result == nil or result == "" then
-    return tabs
-  end
-
-  for _, row in ipairs(split(result, string.char(30))) do
-    local fields = split(row, string.char(31))
-    if #fields >= 6 then
-      local tab = {
-        windowId = fields[1],
-        windowIndex = tonumber(fields[2]),
-        tabIndex = tonumber(fields[3]),
-        tabId = fields[4],
-        title = fields[5],
-        url = fields[6],
-      }
-      table.insert(tabs, tab)
+  local task
+  task = hs.task.new("/bin/zsh", function(exitCode, stdout, stderr)
+    if activeRefreshTask == task then
+      activeRefreshTask = nil
+      activeRefreshing = false
     end
-  end
-  return tabs
+
+    if exitCode ~= 0 then
+      hs.printf("%s active refresh failed: %s", userAgent, tostring(stderr))
+      return
+    end
+
+    local result = trim(stdout)
+    if result == "" then
+      return
+    end
+
+    local fields = split(result, string.char(31))
+    if #fields >= 5 then
+      observeActiveTab({
+        windowId = fields[1],
+        tabIndex = tonumber(fields[2]),
+        tabId = fields[3],
+        title = fields[4],
+        url = fields[5],
+      })
+    end
+  end, { "-lc", command })
+
+  activeRefreshTask = task
+  task:start()
+
+  hs.timer.doAfter(activeRefreshTimeoutSeconds, function()
+    if activeRefreshTask == task and activeRefreshing then
+      pcall(function()
+        task:terminate()
+      end)
+      activeRefreshTask = nil
+      activeRefreshing = false
+      hs.printf("%s active refresh timed out", userAgent)
+    end
+  end)
 end
 
 local function refreshTabCache()
@@ -860,8 +835,10 @@ local function showChromeSwitcher()
   chooser:show()
 end
 
+refreshActiveTab()
 refreshTabCache()
 refreshHistoryCache()
+timers.refreshActiveTab = hs.timer.doEvery(activeRefreshIntervalSeconds, refreshActiveTab)
 timers.refreshTabCache = hs.timer.doEvery(tabRefreshIntervalSeconds, refreshTabCache)
 timers.refreshHistoryCache = hs.timer.doEvery(historyRefreshIntervalSeconds, refreshHistoryCache)
 
@@ -995,9 +972,11 @@ ChromeSwitcher = {
       mruCount = #mruOrder,
       currentActiveKey = currentActiveKey,
       timers = {
+        refreshActiveTab = timers.refreshActiveTab and timers.refreshActiveTab:running(),
         refreshTabCache = timers.refreshTabCache and timers.refreshTabCache:running(),
         refreshHistoryCache = timers.refreshHistoryCache and timers.refreshHistoryCache:running(),
       },
+      activeRefreshing = activeRefreshing,
       tabRefreshing = tabRefreshing,
       historyCount = #cachedHistory,
       historyUrlCount = tableKeyCount(historyByUrl),
