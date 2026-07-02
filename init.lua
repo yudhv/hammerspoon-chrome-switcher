@@ -201,6 +201,11 @@ local function chromeIsRunning()
   return hs.application.get(chromeBundleID) ~= nil
 end
 
+local function chromeIsFocused()
+  local front = hs.application.frontmostApplication()
+  return front ~= nil and front:bundleID() == chromeBundleID
+end
+
 local function runAppleScript(script)
   local ok, result = hs.osascript.applescript(script)
   if not ok then
@@ -287,7 +292,7 @@ local function observeActiveTab(active)
 end
 
 local function refreshActiveTab()
-  if not chromeIsRunning() or activeRefreshing then
+  if not chromeIsRunning() or not chromeIsFocused() or activeRefreshing then
     return
   end
 
@@ -794,6 +799,10 @@ local function commitSelectedChoice()
 end
 
 local function showChromeSwitcher()
+  if not chromeIsRunning() or not chromeIsFocused() then
+    return
+  end
+
   if chooser and chooser:isVisible() then
     chooser:select()
     return
@@ -866,6 +875,10 @@ keyWatcher = hs.eventtap.new({ keyDown, keyUp, flagsChanged }, function(event)
 
   local code = event:getKeyCode()
   if code == keyCodes.tab then
+    if not chooserVisible and not chromeIsFocused() then
+      return false
+    end
+
     local isRepeat = event:getProperty(hs.eventtap.event.properties.keyboardEventAutorepeat) == 1
     if isRepeat then
       return true
@@ -964,6 +977,7 @@ ChromeSwitcher = {
     return {
       chooserVisible = chooserVisible,
       chromeRunning = chromeIsRunning(),
+      chromeFocused = chromeIsFocused(),
       secureInput = hs.eventtap.isSecureInputEnabled(),
       keyWatcherEnabled = keyWatcher and keyWatcher:isEnabled(),
       selectedRow = selectedRow,
